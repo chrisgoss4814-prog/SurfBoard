@@ -1731,6 +1731,21 @@ public class LatinIME extends InputMethodService implements
         startActivity(intent);
     }
 
+    /** SurfBoard: launches the AI command dialog, which rewrites a casual typed request
+     * into a mobilerun instruction (via xAI) and dispatches it to the local mobilerun endpoint. */
+    public void launchAiCommand() {
+        final MainKeyboardView mainKeyboardView = mKeyboardSwitcher.getMainKeyboardView();
+        if (mainKeyboardView != null) {
+            mainKeyboardView.closing();
+        }
+        final Intent intent = new Intent();
+        intent.setClass(LatinIME.this, helium314.keyboard.latin.aicommand.AiCommandActivity.class);
+        intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
+                | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        startActivity(intent);
+    }
+
     public void launchEmojiSearch() {
         Log.d("emoji-search", "before activity launch");
         startActivity(new Intent().setClass(this, EmojiSearchActivity.class)
