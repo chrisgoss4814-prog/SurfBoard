@@ -6,8 +6,6 @@ import android.content.SharedPreferences
 import android.graphics.Color
 import android.os.Bundle
 import android.text.InputType
-import android.view.Gravity
-import android.view.View
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
@@ -24,12 +22,14 @@ import java.net.URL
 /**
  * SurfBoard AI command mode.
  *
- * The user types a casual request. This activity sends it to xAI (Grok) with a system
- * prompt asking for a clean mobilerun instruction back, then POSTs that instruction to
- * the local mobilerun HTTP endpoint (default: http://127.0.0.1:8080/run) for execution.
+ * The user types a casual request. xAI (Grok) rewrites it into a structured action matching
+ * Mobilerun Portal's real REST API, and that action is dispatched directly to the Portal app
+ * running on-device — no mobilerun CLI process required.
  *
- * Kept fully decoupled from the keyboard's input pipeline: this is a standalone screen
- * reachable from a toolbar key, talking to mobilerun only over local HTTP.
+ * Portal's actual surface (confirmed from the app's Connection Details screen):
+ *   GET  /a11y_tree  /a11y_tree_full  /phone_state  /state  /ping  /packages  /screenshot
+ *   POST /keyboard/input  /keyboard/clear  /keyboard/key  /overlay_offset
+ * All requests are sent with the Portal's pairing token.
  */
 class AiCommandActivity : Activity() {
 
@@ -37,7 +37,8 @@ class AiCommandActivity : Activity() {
     private lateinit var commandInput: EditText
     private lateinit var statusText: TextView
     private lateinit var apiKeyInput: EditText
-    private lateinit var endpointInput: EditText
+    private lateinit var baseUrlInput: EditText
+    private lateinit var tokenInput: EditText
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -96,20 +97,29 @@ class AiCommandActivity : Activity() {
         }
         root.addView(apiKeyInput)
 
-        endpointInput = EditText(this).apply {
-            hint = "mobilerun endpoint"
+        baseUrlInput = EditText(this).apply {
+            hint = "Mobilerun Portal base URL"
             setHintTextColor(Color.GRAY)
             setTextColor(Color.WHITE)
-            setText(prefs.getString(PREF_ENDPOINT, DEFAULT_ENDPOINT))
+            setText(prefs.getString(PREF_BASE_URL, DEFAULT_BASE_URL))
         }
-        root.addView(endpointInput)
+        root.addView(baseUrlInput)
+
+        tokenInput = EditText(this).apply {
+            hint = "Portal pairing token (from Connection Details)"
+            setHintTextColor(Color.GRAY)
+            setTextColor(Color.WHITE)
+            setText(prefs.getString(PREF_TOKEN, ""))
+        }
+        root.addView(tokenInput)
 
         val saveButton = Button(this).apply {
             text = "Save settings"
             setOnClickListener {
                 prefs.edit()
                     .putString(PREF_API_KEY, apiKeyInput.text.toString().trim())
-                    .putString(PREF_ENDPOINT, endpointInput.text.toString().trim().ifEmpty { DEFAULT_ENDPOINT })
+                    .putString(PREF_BASE_URL, baseUrlInput.text.toString().trim().ifEmpty { DEFAULT_BASE_URL })
+                    .putString(PREF_TOKEN, tokenInput.text.toString().trim())
                     .apply()
                 Toast.makeText(this@AiCommandActivity, "Saved", Toast.LENGTH_SHORT).show()
             }
@@ -138,28 +148,33 @@ class AiCommandActivity : Activity() {
             return
         }
         val apiKey = prefs.getString(PREF_API_KEY, "")?.trim().orEmpty()
-        val endpoint = prefs.getString(PREF_ENDPOINT, DEFAULT_ENDPOINT) ?: DEFAULT_ENDPOINT
+        val baseUrl = (prefs.getString(PREF_BASE_URL, DEFAULT_BASE_URL) ?: DEFAULT_BASE_URL).trimEnd('/')
+        val token = prefs.getString(PREF_TOKEN, "")?.trim().orEmpty()
         if (apiKey.isEmpty()) {
             statusText.text = "Set your xAI API key in Settings below first."
+            return
+        }
+        if (token.isEmpty()) {
+            statusText.text = "Set the Portal pairing token in Settings below first (copy it from Mobilerun Portal > Connection Details)."
             return
         }
         statusText.text = "Rewriting with Grok…"
         Thread {
             try {
-                val instruction = callXai(apiKey, casualText)
-                runOnUiThread { statusText.text = "Sending to mobilerun…" }
-                val dispatchResult = dispatchToMobilerun(endpoint, instruction)
-                runOnUiThread {
-                    statusText.text = "Instruction: $instruction\n\nmobilerun: $dispatchResult"
-                }
+                val action = callXai(apiKey, casualText)
+                runOnUiThread { statusText.text = "Action: ${action.method} ${action.endpoint}\nSending to Portal…" }
+                val result = dispatchToPortal(baseUrl, token, action)
+                runOnUiThread { statusText.text = "${action.method} ${action.endpoint}\n\n$result" }
             } catch (e: Exception) {
                 runOnUiThread { statusText.text = "Error: ${e.message}" }
             }
         }.start()
     }
 
-    /** Calls xAI's OpenAI-compatible chat completions endpoint and returns the rewritten instruction text. */
-    private fun callXai(apiKey: String, casualText: String): String {
+    private data class PortalAction(val method: String, val endpoint: String, val body: JSONObject?)
+
+    /** Calls xAI's OpenAI-compatible chat completions endpoint and returns a structured Portal action. */
+    private fun callXai(apiKey: String, casualText: String): PortalAction {
         val url = URL("https://api.x.ai/v1/chat/completions")
         val conn = url.openConnection() as HttpURLConnection
         conn.requestMethod = "POST"
@@ -169,25 +184,37 @@ class AiCommandActivity : Activity() {
         conn.connectTimeout = 20000
         conn.readTimeout = 30000
 
+        val systemPrompt = """
+            You control an Android device through the Mobilerun Portal REST API. Given a casual
+            request, output ONLY a single JSON object (no markdown, no explanation) describing the
+            one API call to make. Choose method and endpoint from this exact set:
+
+            GET  /a11y_tree        - inspect the current accessibility tree
+            GET  /a11y_tree_full   - full accessibility tree with extra detail
+            GET  /phone_state      - general phone state
+            GET  /state            - portal state
+            GET  /ping             - connectivity check
+            GET  /packages         - list installed packages
+            GET  /screenshot       - capture the current screen
+            POST /keyboard/input   - body: {"text": "<string to type into the focused field>"}
+            POST /keyboard/clear   - body: {} (clears the focused text field)
+            POST /keyboard/key     - body: {"key": "<key name, e.g. ENTER, BACKSPACE, TAB>"}
+            POST /overlay_offset   - body: {"offset": <integer>}
+
+            Output format: {"method":"GET"|"POST","endpoint":"/path","body":{...}|null}
+            If the request is to type or say something, use POST /keyboard/input with that text.
+            If the request asks about current screen/app/state, use the closest matching GET.
+            Pick the single best-fitting call. Output nothing but the JSON object.
+        """.trimIndent()
+
         val messages = JSONArray().apply {
-            put(JSONObject().apply {
-                put("role", "system")
-                put(
-                    "content",
-                    "You rewrite a casual spoken/typed request into a single, precise, unambiguous " +
-                        "instruction for the mobilerun Android automation agent. Output ONLY the rewritten " +
-                        "instruction as plain text, no quotes, no preamble, no explanation."
-                )
-            })
-            put(JSONObject().apply {
-                put("role", "user")
-                put("content", casualText)
-            })
+            put(JSONObject().apply { put("role", "system"); put("content", systemPrompt) })
+            put(JSONObject().apply { put("role", "user"); put("content", casualText) })
         }
         val body = JSONObject().apply {
             put("model", "grok-4")
             put("messages", messages)
-            put("temperature", 0.2)
+            put("temperature", 0.1)
         }
 
         OutputStreamWriter(conn.outputStream).use { it.write(body.toString()) }
@@ -198,39 +225,52 @@ class AiCommandActivity : Activity() {
         if (code !in 200..299) throw RuntimeException("xAI HTTP $code: $responseText")
 
         val json = JSONObject(responseText)
-        val content = json.getJSONArray("choices")
+        var content = json.getJSONArray("choices")
             .getJSONObject(0)
             .getJSONObject("message")
             .getString("content")
-        return content.trim()
+            .trim()
+        // strip accidental markdown fences
+        if (content.startsWith("```")) {
+            content = content.substringAfter("\n").substringBeforeLast("```").trim()
+        }
+        val actionJson = JSONObject(content)
+        val method = actionJson.getString("method").uppercase()
+        val endpoint = actionJson.getString("endpoint")
+        val actionBody = if (actionJson.isNull("body")) null else actionJson.optJSONObject("body")
+        return PortalAction(method, endpoint, actionBody)
     }
 
-    /** POSTs the rewritten instruction to the local mobilerun HTTP endpoint. */
-    private fun dispatchToMobilerun(endpoint: String, instruction: String): String {
+    /** Sends the structured action directly to Mobilerun Portal, authenticated with the pairing token. */
+    private fun dispatchToPortal(baseUrl: String, token: String, action: PortalAction): String {
         return try {
-            val url = URL(endpoint)
+            val url = URL(baseUrl + action.endpoint)
             val conn = url.openConnection() as HttpURLConnection
-            conn.requestMethod = "POST"
-            conn.setRequestProperty("Content-Type", "application/json")
-            conn.doOutput = true
+            conn.requestMethod = action.method
+            conn.setRequestProperty("Authorization", "Bearer $token")
+            conn.setRequestProperty("X-Auth-Token", token)
             conn.connectTimeout = 5000
             conn.readTimeout = 15000
 
-            val payload = JSONObject().apply { put("instruction", instruction) }
-            OutputStreamWriter(conn.outputStream).use { it.write(payload.toString()) }
+            if (action.method == "POST") {
+                conn.doOutput = true
+                conn.setRequestProperty("Content-Type", "application/json")
+                OutputStreamWriter(conn.outputStream).use { it.write((action.body ?: JSONObject()).toString()) }
+            }
 
             val code = conn.responseCode
             val stream = if (code in 200..299) conn.inputStream else conn.errorStream
             val responseText = stream?.bufferedReader()?.use { it.readText() } ?: ""
-            "HTTP $code $responseText"
+            "HTTP $code\n$responseText"
         } catch (e: Exception) {
-            "not reachable (${e.message}) — instruction copied to status above, run it manually in mobilerun"
+            "Could not reach Portal at $baseUrl (${e.message}). Make sure Mobilerun Portal is open and its Socket Status isn't 'Stopped'."
         }
     }
 
     companion object {
         private const val PREF_API_KEY = "xai_api_key"
-        private const val PREF_ENDPOINT = "mobilerun_endpoint"
-        private const val DEFAULT_ENDPOINT = "http://127.0.0.1:8080/run"
+        private const val PREF_BASE_URL = "portal_base_url"
+        private const val PREF_TOKEN = "portal_token"
+        private const val DEFAULT_BASE_URL = "http://127.0.0.1:8080"
     }
 }
