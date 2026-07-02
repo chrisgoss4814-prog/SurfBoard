@@ -5,6 +5,8 @@ import android.app.Activity
 import android.content.SharedPreferences
 import android.graphics.Color
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.text.InputType
 import android.view.WindowManager
 import android.widget.Button
@@ -158,15 +160,26 @@ class AiCommandActivity : Activity() {
             statusText.text = "Set the Portal pairing token in Settings below first (copy it from Mobilerun Portal > Connection Details)."
             return
         }
-        statusText.text = "Rewriting with Grok…"
+
+        // Close this screen FIRST so the real target app/field regains window and input
+        // focus before we dispatch to Portal. Otherwise Portal sees THIS screen as focused
+        // (that was the earlier bug: it typed into the AI Command screen's own field).
+        val appContext = applicationContext
+        Toast.makeText(appContext, "Running…", Toast.LENGTH_SHORT).show()
+        finish()
+
         Thread {
             try {
+                Thread.sleep(700) // let the target app's window regain input focus after we close
                 val action = callXai(apiKey, casualText)
-                runOnUiThread { statusText.text = "Action: ${action.method} ${action.endpoint}\nSending to Portal…" }
                 val result = dispatchToPortal(baseUrl, token, action)
-                runOnUiThread { statusText.text = "${action.method} ${action.endpoint}\n\n$result" }
+                Handler(Looper.getMainLooper()).post {
+                    Toast.makeText(appContext, "${action.method} ${action.endpoint} -> $result".take(200), Toast.LENGTH_LONG).show()
+                }
             } catch (e: Exception) {
-                runOnUiThread { statusText.text = "Error: ${e.message}" }
+                Handler(Looper.getMainLooper()).post {
+                    Toast.makeText(appContext, "AI Command error: ${e.message}", Toast.LENGTH_LONG).show()
+                }
             }
         }.start()
     }
