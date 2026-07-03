@@ -24,14 +24,14 @@ import java.net.URL
 /**
  * SurfBoard AI command mode.
  *
- * The user types a casual request. xAI (Grok) rewrites it into a structured action matching
- * Mobilerun Portal's real REST API, and that action is dispatched directly to the Portal app
- * running on-device — no mobilerun CLI process required.
+ * The user types a natural language goal. xAI (Grok) reads the current screen state
+ * and returns a multi-step action plan. Each step is executed against Mobilerun Portal.
+ * After each step the screen state is re-read so the AI can decide what to do next.
+ * Execution stops when the AI says the task is done OR when it detects it is stuck.
  *
- * Portal's actual surface (confirmed from the app's Connection Details screen):
+ * Portal endpoints used:
  *   GET  /a11y_tree  /a11y_tree_full  /phone_state  /state  /ping  /packages  /screenshot
  *   POST /keyboard/input  /keyboard/clear  /keyboard/key  /overlay_offset
- * All requests are sent with the Portal's pairing token.
  */
 class AiCommandActivity : Activity() {
 
@@ -71,7 +71,7 @@ class AiCommandActivity : Activity() {
         root.addView(commandInput)
 
         val runButton = Button(this).apply {
-            text = "Rewrite & Run"
+            text = "Run"
             setOnClickListener { onRunClicked() }
         }
         root.addView(runButton)
@@ -108,7 +108,7 @@ class AiCommandActivity : Activity() {
         root.addView(baseUrlInput)
 
         tokenInput = EditText(this).apply {
-            hint = "Portal pairing token (from Connection Details)"
+            hint = "Portal pairing token"
             setHintTextColor(Color.GRAY)
             setTextColor(Color.WHITE)
             setText(prefs.getString(PREF_TOKEN, ""))
@@ -144,50 +144,119 @@ class AiCommandActivity : Activity() {
     }
 
     private fun onRunClicked() {
-        val casualText = commandInput.text.toString().trim()
-        if (casualText.isEmpty()) {
-            statusText.text = "Type a request first."
-            return
-        }
+        val goal = commandInput.text.toString().trim()
+        if (goal.isEmpty()) { statusText.text = "Type a request first."; return }
         val apiKey = prefs.getString(PREF_API_KEY, "")?.trim().orEmpty()
         val baseUrl = (prefs.getString(PREF_BASE_URL, DEFAULT_BASE_URL) ?: DEFAULT_BASE_URL).trimEnd('/')
         val token = prefs.getString(PREF_TOKEN, "")?.trim().orEmpty()
-        if (apiKey.isEmpty()) {
-            statusText.text = "Set your xAI API key in Settings below first."
-            return
-        }
-        if (token.isEmpty()) {
-            statusText.text = "Set the Portal pairing token in Settings below first (copy it from Mobilerun Portal > Connection Details)."
-            return
-        }
+        if (apiKey.isEmpty()) { statusText.text = "Set your xAI API key first."; return }
+        if (token.isEmpty()) { statusText.text = "Set the Portal pairing token first."; return }
 
-        // Close this screen FIRST so the real target app/field regains window and input
-        // focus before we dispatch to Portal. Otherwise Portal sees THIS screen as focused
-        // (that was the earlier bug: it typed into the AI Command screen's own field).
         val appContext = applicationContext
         Toast.makeText(appContext, "Running…", Toast.LENGTH_SHORT).show()
         finish()
 
         Thread {
+            val log = StringBuilder()
             try {
-                Thread.sleep(700) // let the target app's window regain input focus after we close
-                val action = callXai(apiKey, casualText)
-                val result = dispatchToPortal(baseUrl, token, action)
-                Handler(Looper.getMainLooper()).post {
-                    Toast.makeText(appContext, "${action.method} ${action.endpoint} -> $result".take(200), Toast.LENGTH_LONG).show()
-                }
+                Thread.sleep(700)
+                runAutonomousLoop(apiKey, baseUrl, token, goal, appContext, log)
             } catch (e: Exception) {
                 Handler(Looper.getMainLooper()).post {
-                    Toast.makeText(appContext, "AI Command error: ${e.message}", Toast.LENGTH_LONG).show()
+                    Toast.makeText(appContext, "Error: ${e.message?.take(150)}", Toast.LENGTH_LONG).show()
                 }
             }
         }.start()
     }
 
-    private data class PortalAction(val method: String, val endpoint: String, val body: JSONObject?)
+    private fun runAutonomousLoop(
+        apiKey: String,
+        baseUrl: String,
+        token: String,
+        goal: String,
+        appContext: android.content.Context,
+        log: StringBuilder
+    ) {
+        val MAX_STEPS = 12
+        val MAX_STUCK = 3
+        var stepCount = 0
+        var stuckCount = 0
+        var lastAction = ""
+        val history = StringBuilder()
 
-    /** Calls xAI's OpenAI-compatible chat completions endpoint and returns a structured Portal action. */
-    private fun callXai(apiKey: String, casualText: String): PortalAction {
+        while (stepCount < MAX_STEPS) {
+            stepCount++
+
+            // Read current screen state
+            val screenState = try {
+                portalGet(baseUrl, token, "/a11y_tree")
+            } catch (e: Exception) {
+                "Screen read failed: ${e.message}"
+            }
+
+            // Ask AI what to do next
+            val decision = callXai(apiKey, goal, screenState, history.toString())
+
+            if (decision.done) {
+                Handler(Looper.getMainLooper()).post {
+                    Toast.makeText(appContext, "Done: ${decision.reason}", Toast.LENGTH_LONG).show()
+                }
+                return
+            }
+
+            if (decision.stuck) {
+                stuckCount++
+                if (stuckCount >= MAX_STUCK) {
+                    Handler(Looper.getMainLooper()).post {
+                        Toast.makeText(appContext, "Stopped: ${decision.reason}", Toast.LENGTH_LONG).show()
+                    }
+                    return
+                }
+            } else {
+                stuckCount = 0
+            }
+
+            // Detect repeated action (stuck loop)
+            val actionKey = "${decision.action.method}${decision.action.endpoint}${decision.action.body}"
+            if (actionKey == lastAction) {
+                stuckCount++
+                if (stuckCount >= MAX_STUCK) {
+                    Handler(Looper.getMainLooper()).post {
+                        Toast.makeText(appContext, "Stopped: repeating same action with no progress", Toast.LENGTH_LONG).show()
+                    }
+                    return
+                }
+            }
+            lastAction = actionKey
+
+            // Execute the action
+            val result = try {
+                dispatchToPortal(baseUrl, token, decision.action)
+            } catch (e: Exception) {
+                "dispatch error: ${e.message}"
+            }
+
+            history.append("Step $stepCount: ${decision.action.method} ${decision.action.endpoint} -> ${result.take(200)}
+")
+
+            // Brief pause between steps so UI can settle
+            Thread.sleep(800)
+        }
+
+        Handler(Looper.getMainLooper()).post {
+            Toast.makeText(appContext, "Reached max steps ($MAX_STEPS) without finishing", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private data class PortalAction(val method: String, val endpoint: String, val body: JSONObject?)
+    private data class AiDecision(
+        val action: PortalAction,
+        val done: Boolean,
+        val stuck: Boolean,
+        val reason: String
+    )
+
+    private fun callXai(apiKey: String, goal: String, screenState: String, history: String): AiDecision {
         val url = URL("https://api.x.ai/v1/chat/completions")
         val conn = url.openConnection() as HttpURLConnection
         conn.requestMethod = "POST"
@@ -198,31 +267,48 @@ class AiCommandActivity : Activity() {
         conn.readTimeout = 30000
 
         val systemPrompt = """
-            You control an Android device through the Mobilerun Portal REST API. Given a casual
-            request, output ONLY a single JSON object (no markdown, no explanation) describing the
-            one API call to make. Choose method and endpoint from this exact set:
+You are an autonomous Android controller. You see the current screen state and decide the next single action to take toward completing the user's goal.
 
-            GET  /a11y_tree        - inspect the current accessibility tree
-            GET  /a11y_tree_full   - full accessibility tree with extra detail
-            GET  /phone_state      - general phone state
-            GET  /state            - portal state
-            GET  /ping             - connectivity check
-            GET  /packages         - list installed packages
-            GET  /screenshot       - capture the current screen
-            POST /keyboard/input   - body: {"text": "<string to type into the focused field>"}
-            POST /keyboard/clear   - body: {} (clears the focused text field)
-            POST /keyboard/key     - body: {"key": "<key name, e.g. ENTER, BACKSPACE, TAB>"}
-            POST /overlay_offset   - body: {"offset": <integer>}
+Portal API endpoints available:
+  GET  /a11y_tree        - current accessibility tree
+  GET  /a11y_tree_full   - full accessibility tree
+  GET  /phone_state      - phone state
+  GET  /packages         - installed packages
+  GET  /screenshot       - capture screen
+  POST /keyboard/input   - body: {"text": "<text to type>"}
+  POST /keyboard/clear   - body: {} clears focused field
+  POST /keyboard/key     - body: {"key": "ENTER"|"BACKSPACE"|"TAB"|"BACK"|"HOME"|"APP_SWITCH"}
 
-            Output format: {"method":"GET"|"POST","endpoint":"/path","body":{...}|null}
-            If the request is to type or say something, use POST /keyboard/input with that text.
-            If the request asks about current screen/app/state, use the closest matching GET.
-            Pick the single best-fitting call. Output nothing but the JSON object.
+Respond with ONLY a JSON object in this exact format:
+{
+  "method": "GET" or "POST",
+  "endpoint": "/path",
+  "body": null or {...},
+  "done": true or false,
+  "stuck": true or false,
+  "reason": "brief explanation of what you are doing or why you stopped"
+}
+
+Set done=true when the goal is fully complete.
+Set stuck=true when the screen is not responding or you cannot make progress.
+Set done=false and stuck=false to continue to the next step.
+        """.trimIndent()
+
+        val userContent = """
+Goal: $goal
+
+Screen state:
+${screenState.take(3000)}
+
+${if (history.isNotEmpty()) "Steps taken so far:
+$history" else ""}
+
+What is the single best next action?
         """.trimIndent()
 
         val messages = JSONArray().apply {
             put(JSONObject().apply { put("role", "system"); put("content", systemPrompt) })
-            put(JSONObject().apply { put("role", "user"); put("content", casualText) })
+            put(JSONObject().apply { put("role", "user"); put("content", userContent) })
         }
         val body = JSONObject().apply {
             put("model", "grok-4")
@@ -237,24 +323,44 @@ class AiCommandActivity : Activity() {
         val responseText = stream.bufferedReader().use { it.readText() }
         if (code !in 200..299) throw RuntimeException("xAI HTTP $code: $responseText")
 
-        val json = JSONObject(responseText)
-        var content = json.getJSONArray("choices")
+        var content = JSONObject(responseText)
+            .getJSONArray("choices")
             .getJSONObject(0)
             .getJSONObject("message")
             .getString("content")
             .trim()
-        // strip accidental markdown fences
         if (content.startsWith("```")) {
-            content = content.substringAfter("\n").substringBeforeLast("```").trim()
+            content = content.substringAfter("
+").substringBeforeLast("```").trim()
         }
-        val actionJson = JSONObject(content)
-        val method = actionJson.getString("method").uppercase()
-        val endpoint = actionJson.getString("endpoint")
-        val actionBody = if (actionJson.isNull("body")) null else actionJson.optJSONObject("body")
-        return PortalAction(method, endpoint, actionBody)
+
+        val j = JSONObject(content)
+        val action = PortalAction(
+            method = j.getString("method").uppercase(),
+            endpoint = j.getString("endpoint"),
+            body = if (j.isNull("body")) null else j.optJSONObject("body")
+        )
+        return AiDecision(
+            action = action,
+            done = j.optBoolean("done", false),
+            stuck = j.optBoolean("stuck", false),
+            reason = j.optString("reason", "")
+        )
     }
 
-    /** Sends the structured action directly to Mobilerun Portal, authenticated with the pairing token. */
+    private fun portalGet(baseUrl: String, token: String, endpoint: String): String {
+        val url = URL(baseUrl + endpoint)
+        val conn = url.openConnection() as HttpURLConnection
+        conn.requestMethod = "GET"
+        conn.setRequestProperty("Authorization", "Bearer $token")
+        conn.setRequestProperty("X-Auth-Token", token)
+        conn.connectTimeout = 5000
+        conn.readTimeout = 10000
+        val code = conn.responseCode
+        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+        return stream?.bufferedReader()?.use { it.readText() } ?: ""
+    }
+
     private fun dispatchToPortal(baseUrl: String, token: String, action: PortalAction): String {
         return try {
             val url = URL(baseUrl + action.endpoint)
@@ -274,9 +380,9 @@ class AiCommandActivity : Activity() {
             val code = conn.responseCode
             val stream = if (code in 200..299) conn.inputStream else conn.errorStream
             val responseText = stream?.bufferedReader()?.use { it.readText() } ?: ""
-            "HTTP $code\n$responseText"
+            "HTTP $code $responseText"
         } catch (e: Exception) {
-            "Could not reach Portal at $baseUrl (${e.message}). Make sure Mobilerun Portal is open and its Socket Status isn't 'Stopped'."
+            "Could not reach Portal at $baseUrl: ${e.message}"
         }
     }
 
