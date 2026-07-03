@@ -2,6 +2,7 @@
 package helium314.keyboard.latin.aicommand
 
 import android.app.Activity
+import android.content.Context
 import android.content.SharedPreferences
 import android.graphics.Color
 import android.os.Bundle
@@ -174,7 +175,7 @@ class AiCommandActivity : Activity() {
         baseUrl: String,
         token: String,
         goal: String,
-        appContext: android.content.Context,
+        appContext: Context,
         log: StringBuilder
     ) {
         val MAX_STEPS = 12
