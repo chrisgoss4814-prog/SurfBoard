@@ -316,17 +316,29 @@ class AiCommandActivity : Activity() {
             {"method":"GET|POST","endpoint":"/path","body":{...}|null,"done":false,"stuck":false,"reason":"short"}
 
             Endpoints:
-              GET  /a11y_tree      inspect current screen elements
+              GET  /a11y_tree      inspect current screen elements (each element has bounds)
               GET  /state          screen + phone state
-              GET  /screenshot     capture screen
+              POST /gesture/tap    body {"x":<int>,"y":<int>}        tap a screen point
+              POST /gesture/swipe  body {"x1":..,"y1":..,"x2":..,"y2":..} swipe/scroll
               POST /keyboard/input body {"text":"<text to type>"}   (app encodes it for Portal)
               POST /keyboard/clear body {}                            clears the focused field
               POST /keyboard/key   body {"key":"ENTER|BACKSPACE|TAB|BACK|HOME"}  (app maps to key_code)
 
+            To TAP an element: read its bounds from the screen state, compute the CENTER
+            point (x=(left+right)/2, y=(top+bottom)/2), and POST /gesture/tap with that x,y.
+
+            To OPEN ANY APP (universal, nothing hardcoded):
+            1. POST /keyboard/key {"key":"HOME"} to reach the home screen.
+            2. Open the app drawer (swipe up from bottom, or tap the app-drawer icon).
+            3. Read the screen, find the target app's icon by label, tap its center.
+            4. Wait, then continue the goal inside that app.
+
             Rules:
             - Return the SINGLE best next action toward the goal.
+            - Prefer /gesture/tap on element centers to press buttons and open things.
+            - Use HOME + app drawer to reach any app you are not currently in.
             - Set "done":true only when the goal is fully accomplished.
-            - Set "stuck":true if the screen shows you cannot proceed (e.g. nothing actionable).
+            - Set "stuck":true only if truly nothing can advance the goal.
             - Keep "reason" under 12 words.
         """.trimIndent()
 
@@ -446,6 +458,24 @@ class AiCommandActivity : Activity() {
      * translate here so the autonomous plan works regardless of how the action was phrased.
      */
     private fun normalizePortalBody(endpoint: String, body: JSONObject?): JSONObject {
+        run {
+            val b0 = body ?: JSONObject()
+            if (endpoint.contains("/gesture/tap") || endpoint.endsWith("/tap")) {
+                val out = JSONObject()
+                out.put("x", b0.optInt("x", b0.optInt("centerX", b0.optInt("cx", -1))))
+                out.put("y", b0.optInt("y", b0.optInt("centerY", b0.optInt("cy", -1))))
+                return out
+            }
+            if (endpoint.contains("/gesture/swipe") || endpoint.endsWith("/swipe")) {
+                val out = JSONObject()
+                out.put("x1", b0.optInt("x1", b0.optInt("startX", 0)))
+                out.put("y1", b0.optInt("y1", b0.optInt("startY", 0)))
+                out.put("x2", b0.optInt("x2", b0.optInt("endX", 0)))
+                out.put("y2", b0.optInt("y2", b0.optInt("endY", 0)))
+                if (b0.has("duration")) out.put("duration", b0.optInt("duration"))
+                return out
+            }
+        }
         val b = body ?: JSONObject()
         when {
             endpoint.contains("/keyboard/input") -> {
