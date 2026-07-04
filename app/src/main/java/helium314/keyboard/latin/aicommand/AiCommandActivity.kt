@@ -82,6 +82,14 @@ class AiCommandActivity : Activity() {
         }
         root.addView(statusText)
 
+        val viewLogButton = Button(this).apply {
+            text = "View last run log"
+            setOnClickListener {
+                statusText.text = prefs.getString(PREF_LOG, "No log yet. Run a task first.")
+            }
+        }
+        root.addView(viewLogButton)
+
         val settingsTitle = TextView(this).apply {
             text = "Settings"
             textSize = 16f
@@ -201,7 +209,12 @@ class AiCommandActivity : Activity() {
         var lastActionKey = ""
         var lastScreenSig = ""
         val history = StringBuilder()
+        val log = StringBuilder()
         val main = Handler(Looper.getMainLooper())
+
+        fun saveLog() { prefs.edit().putString(PREF_LOG, log.toString()).apply() }
+        log.append("GOAL: ").append(goal).append("\n\n")
+        saveLog()
 
         var step = 0
         while (step < maxSteps) {
@@ -214,16 +227,26 @@ class AiCommandActivity : Activity() {
                 try { portalGet(baseUrl, token, "/a11y_tree") } catch (e2: Exception) { "" }
             }
             val screenSig = screen.hashCode().toString()
+            log.append("--- Step ").append(step).append(" ---\n")
+            log.append("screen(").append(screen.length).append(" chars): ").append(screen.take(200)).append("\n")
+            saveLog()
 
             // 2. Ask Grok what to do next.
             val stepPlan = try {
                 planNextStep(apiKey, goal, screen, history.toString())
             } catch (e: Exception) {
+                log.append("AI ERROR: ").append(e.message).append("\n"); saveLog()
                 main.post { Toast.makeText(ctx, "AI error on step $step: ${e.message}".take(200), Toast.LENGTH_LONG).show() }
                 return
             }
 
+            log.append("AI plan: ").append(stepPlan.action.method).append(" ").append(stepPlan.action.endpoint)
+               .append(" body=").append(stepPlan.action.body?.toString() ?: "null")
+               .append(" done=").append(stepPlan.done).append(" stuck=").append(stepPlan.stuck)
+               .append(" reason=").append(stepPlan.reason).append("\n")
+            saveLog()
             if (stepPlan.done) {
+                log.append("RESULT: task reported done.\n"); saveLog()
                 main.post { Toast.makeText(ctx, "Done ($step steps): ${stepPlan.reason}".take(200), Toast.LENGTH_LONG).show() }
                 return
             }
@@ -234,6 +257,7 @@ class AiCommandActivity : Activity() {
             if (stepPlan.stuck || noProgress) {
                 stuckCount++
                 if (stuckCount >= stuckLimit) {
+                    log.append("STOPPED: stuck (no progress) at step ").append(step).append(".\n"); saveLog()
                     main.post { Toast.makeText(ctx, "Stopped - stuck at step $step: ${stepPlan.reason}".take(200), Toast.LENGTH_LONG).show() }
                     return
                 }
@@ -245,6 +269,7 @@ class AiCommandActivity : Activity() {
 
             // 4. Dispatch the action.
             val result = dispatchToPortal(baseUrl, token, stepPlan.action)
+            log.append("Portal response: ").append(result.take(300)).append("\n\n"); saveLog()
             val stepNum = step
             main.post { Toast.makeText(ctx, "Step $stepNum: ${stepPlan.action.endpoint}".take(120), Toast.LENGTH_SHORT).show() }
             history.append("Step $step: ${stepPlan.action.method} ${stepPlan.action.endpoint} -> ${result.take(120)}\n")
@@ -253,6 +278,7 @@ class AiCommandActivity : Activity() {
             try { Thread.sleep(1200) } catch (e: InterruptedException) { return }
         }
 
+        log.append("ENDED: reached ").append(maxSteps).append(" steps without a done signal.\n"); saveLog()
         main.post { Toast.makeText(ctx, "Reached $maxSteps steps without a done signal. Run again to continue.", Toast.LENGTH_LONG).show() }
     }
 
@@ -442,5 +468,6 @@ class AiCommandActivity : Activity() {
         private const val PREF_BASE_URL = "portal_base_url"
         private const val PREF_TOKEN = "portal_token"
         private const val DEFAULT_BASE_URL = "http://127.0.0.1:8080"
+        private const val PREF_LOG = "last_run_log"
     }
 }
