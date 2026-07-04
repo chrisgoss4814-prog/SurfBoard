@@ -5,6 +5,7 @@ import android.app.Activity
 import android.content.SharedPreferences
 import android.graphics.Color
 import android.os.Bundle
+import android.util.Base64
 import android.os.Handler
 import android.os.Looper
 import android.text.InputType
@@ -318,9 +319,9 @@ class AiCommandActivity : Activity() {
               GET  /a11y_tree      inspect current screen elements
               GET  /state          screen + phone state
               GET  /screenshot     capture screen
-              POST /keyboard/input body {"text":"<text to type into focused field>"}
-              POST /keyboard/clear body {} clears the focused field
-              POST /keyboard/key   body {"key":"ENTER|BACKSPACE|TAB|BACK|HOME"}
+              POST /keyboard/input body {"text":"<text to type>"}   (app encodes it for Portal)
+              POST /keyboard/clear body {}                            clears the focused field
+              POST /keyboard/key   body {"key":"ENTER|BACKSPACE|TAB|BACK|HOME"}  (app maps to key_code)
 
             Rules:
             - Return the SINGLE best next action toward the goal.
@@ -438,6 +439,51 @@ class AiCommandActivity : Activity() {
     }
 
     /** Sends the structured action directly to Mobilerun Portal, authenticated with the pairing token. */
+    /**
+     * Converts an action body into the exact shape Mobilerun Portal expects, so typing and key
+     * presses actually execute. Portal wants base64-encoded text for /keyboard/input and a numeric
+     * key_code for /keyboard/key. Grok may phrase these as {"text":...} or {"key":"ENTER"}; we
+     * translate here so the autonomous plan works regardless of how the action was phrased.
+     */
+    private fun normalizePortalBody(endpoint: String, body: JSONObject?): JSONObject {
+        val b = body ?: JSONObject()
+        when {
+            endpoint.contains("/keyboard/input") -> {
+                // Already correct?
+                if (b.has("base64_text")) return b
+                val text = b.optString("text", b.optString("base64_text", ""))
+                val encoded = Base64.encodeToString(text.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+                val out = JSONObject()
+                out.put("base64_text", encoded)
+                // preserve clear flag if Grok set one
+                if (b.has("clear")) out.put("clear", b.optBoolean("clear", true))
+                return out
+            }
+            endpoint.contains("/keyboard/key") -> {
+                if (b.has("key_code")) return b
+                val keyName = b.optString("key", "").uppercase()
+                val code = when (keyName) {
+                    "ENTER" -> 66
+                    "BACKSPACE", "DELETE", "DEL" -> 67
+                    "TAB" -> 61
+                    "SPACE" -> 62
+                    "BACK" -> 4
+                    "HOME" -> 3
+                    "DPAD_DOWN", "DOWN" -> 20
+                    "DPAD_UP", "UP" -> 19
+                    "DPAD_LEFT", "LEFT" -> 21
+                    "DPAD_RIGHT", "RIGHT" -> 22
+                    "SEARCH" -> 84
+                    else -> b.optInt("key_code", 66)
+                }
+                val out = JSONObject()
+                out.put("key_code", code)
+                return out
+            }
+            else -> return b
+        }
+    }
+
     private fun dispatchToPortal(baseUrl: String, token: String, action: PortalAction): String {
         return try {
             val url = URL(baseUrl + action.endpoint)
@@ -451,7 +497,8 @@ class AiCommandActivity : Activity() {
             if (action.method == "POST") {
                 conn.doOutput = true
                 conn.setRequestProperty("Content-Type", "application/json")
-                OutputStreamWriter(conn.outputStream).use { it.write((action.body ?: JSONObject()).toString()) }
+                val outBody = normalizePortalBody(action.endpoint, action.body)
+                OutputStreamWriter(conn.outputStream).use { it.write(outBody.toString()) }
             }
 
             val code = conn.responseCode
