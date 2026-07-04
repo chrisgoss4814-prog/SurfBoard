@@ -171,17 +171,174 @@ class AiCommandActivity : Activity() {
         Thread {
             try {
                 Thread.sleep(700) // let the target app's window regain input focus after we close
-                val action = callXai(apiKey, casualText)
-                val result = dispatchToPortal(baseUrl, token, action)
-                Handler(Looper.getMainLooper()).post {
-                    Toast.makeText(appContext, "${action.method} ${action.endpoint} -> $result".take(200), Toast.LENGTH_LONG).show()
-                }
+                runAutonomousLoop(apiKey, baseUrl, token, casualText, appContext)
             } catch (e: Exception) {
                 Handler(Looper.getMainLooper()).post {
                     Toast.makeText(appContext, "AI Command error: ${e.message}", Toast.LENGTH_LONG).show()
                 }
             }
         }.start()
+    }
+
+    private data class AiStep(val action: PortalAction, val done: Boolean, val stuck: Boolean, val reason: String)
+
+    /**
+     * Autonomous loop: read screen -> ask Grok for the next single action -> dispatch -> repeat.
+     * Auto-continues through long tasks. Stops only when Grok says the task is done, or when it
+     * detects it is stuck (same action repeated with no screen change). A high ceiling guards
+     * against runaway credit use without cutting off legitimately long tasks.
+     */
+    private fun runAutonomousLoop(
+        apiKey: String,
+        baseUrl: String,
+        token: String,
+        goal: String,
+        ctx: android.content.Context
+    ) {
+        val maxSteps = 40
+        val stuckLimit = 3
+        var stuckCount = 0
+        var lastActionKey = ""
+        var lastScreenSig = ""
+        val history = StringBuilder()
+        val main = Handler(Looper.getMainLooper())
+
+        var step = 0
+        while (step < maxSteps) {
+            step++
+
+            // 1. Read the current screen state from Portal.
+            val screen = try {
+                portalGet(baseUrl, token, "/state")
+            } catch (e: Exception) {
+                try { portalGet(baseUrl, token, "/a11y_tree") } catch (e2: Exception) { "" }
+            }
+            val screenSig = screen.hashCode().toString()
+
+            // 2. Ask Grok what to do next.
+            val stepPlan = try {
+                planNextStep(apiKey, goal, screen, history.toString())
+            } catch (e: Exception) {
+                main.post { Toast.makeText(ctx, "AI error on step $step: ${e.message}".take(200), Toast.LENGTH_LONG).show() }
+                return
+            }
+
+            if (stepPlan.done) {
+                main.post { Toast.makeText(ctx, "Done ($step steps): ${stepPlan.reason}".take(200), Toast.LENGTH_LONG).show() }
+                return
+            }
+
+            // 3. Stuck detection: same action AND screen unchanged, or Grok flags stuck.
+            val actionKey = "${stepPlan.action.method} ${stepPlan.action.endpoint} ${stepPlan.action.body}"
+            val noProgress = (actionKey == lastActionKey && screenSig == lastScreenSig)
+            if (stepPlan.stuck || noProgress) {
+                stuckCount++
+                if (stuckCount >= stuckLimit) {
+                    main.post { Toast.makeText(ctx, "Stopped - stuck at step $step: ${stepPlan.reason}".take(200), Toast.LENGTH_LONG).show() }
+                    return
+                }
+            } else {
+                stuckCount = 0
+            }
+            lastActionKey = actionKey
+            lastScreenSig = screenSig
+
+            // 4. Dispatch the action.
+            val result = dispatchToPortal(baseUrl, token, stepPlan.action)
+            val stepNum = step
+            main.post { Toast.makeText(ctx, "Step $stepNum: ${stepPlan.action.endpoint}".take(120), Toast.LENGTH_SHORT).show() }
+            history.append("Step $step: ${stepPlan.action.method} ${stepPlan.action.endpoint} -> ${result.take(120)}\n")
+
+            // 5. Let the UI settle before reading again.
+            try { Thread.sleep(1200) } catch (e: InterruptedException) { return }
+        }
+
+        main.post { Toast.makeText(ctx, "Reached $maxSteps steps without a done signal. Run again to continue.", Toast.LENGTH_LONG).show() }
+    }
+
+    /** Reads a GET endpoint from Portal and returns the raw body (used to feed screen state to Grok). */
+    private fun portalGet(baseUrl: String, token: String, endpoint: String): String {
+        val url = URL(baseUrl + endpoint)
+        val conn = url.openConnection() as HttpURLConnection
+        conn.requestMethod = "GET"
+        conn.setRequestProperty("Authorization", "Bearer $token")
+        conn.setRequestProperty("X-Auth-Token", token)
+        conn.connectTimeout = 5000
+        conn.readTimeout = 15000
+        val code = conn.responseCode
+        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+        return stream?.bufferedReader()?.use { it.readText() } ?: ""
+    }
+
+    /** Asks Grok for the next single step toward the goal, given the current screen + history. */
+    private fun planNextStep(apiKey: String, goal: String, screen: String, history: String): AiStep {
+        val url = URL("https://api.x.ai/v1/chat/completions")
+        val conn = url.openConnection() as HttpURLConnection
+        conn.requestMethod = "POST"
+        conn.setRequestProperty("Content-Type", "application/json")
+        conn.setRequestProperty("Authorization", "Bearer $apiKey")
+        conn.doOutput = true
+        conn.connectTimeout = 20000
+        conn.readTimeout = 40000
+
+        val systemPrompt = """
+            You drive an Android phone one step at a time through the Mobilerun Portal REST API,
+            to accomplish the user's GOAL. Each turn you get the current screen state and the
+            history of steps already taken. Respond with ONLY one JSON object, no markdown:
+
+            {"method":"GET|POST","endpoint":"/path","body":{...}|null,"done":false,"stuck":false,"reason":"short"}
+
+            Endpoints:
+              GET  /a11y_tree      inspect current screen elements
+              GET  /state          screen + phone state
+              GET  /screenshot     capture screen
+              POST /keyboard/input body {"text":"<text to type into focused field>"}
+              POST /keyboard/clear body {} clears the focused field
+              POST /keyboard/key   body {"key":"ENTER|BACKSPACE|TAB|BACK|HOME"}
+
+            Rules:
+            - Return the SINGLE best next action toward the goal.
+            - Set "done":true only when the goal is fully accomplished.
+            - Set "stuck":true if the screen shows you cannot proceed (e.g. nothing actionable).
+            - Keep "reason" under 12 words.
+        """.trimIndent()
+
+        val userContent = buildString {
+            append("GOAL: ").append(goal).append("\n\n")
+            append("SCREEN STATE:\n").append(screen.take(6000)).append("\n\n")
+            if (history.isNotEmpty()) { append("STEPS SO FAR:\n").append(history.takeLast(1500)).append("\n\n") }
+            append("What is the single next action?")
+        }
+
+        val messages = JSONArray().apply {
+            put(JSONObject().apply { put("role", "system"); put("content", systemPrompt) })
+            put(JSONObject().apply { put("role", "user"); put("content", userContent) })
+        }
+        val body = JSONObject().apply {
+            put("model", "grok-4")
+            put("messages", messages)
+            put("temperature", 0.1)
+        }
+        OutputStreamWriter(conn.outputStream).use { it.write(body.toString()) }
+
+        val code = conn.responseCode
+        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+        val responseText = stream.bufferedReader().use { it.readText() }
+        if (code !in 200..299) throw RuntimeException("xAI HTTP $code: $responseText")
+
+        var contentStr = JSONObject(responseText)
+            .getJSONArray("choices").getJSONObject(0)
+            .getJSONObject("message").getString("content").trim()
+        if (contentStr.startsWith("```")) {
+            contentStr = contentStr.substringAfter("\n").substringBeforeLast("```").trim()
+        }
+        val j = JSONObject(contentStr)
+        val action = PortalAction(
+            j.getString("method").uppercase(),
+            j.getString("endpoint"),
+            if (j.isNull("body")) null else j.optJSONObject("body")
+        )
+        return AiStep(action, j.optBoolean("done", false), j.optBoolean("stuck", false), j.optString("reason", ""))
     }
 
     private data class PortalAction(val method: String, val endpoint: String, val body: JSONObject?)
