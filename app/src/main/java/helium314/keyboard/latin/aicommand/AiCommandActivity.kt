@@ -91,6 +91,17 @@ class AiCommandActivity : Activity() {
         }
         root.addView(viewLogButton)
 
+        val copyLogButton = Button(this).apply {
+            text = "Copy log"
+            setOnClickListener {
+                val logText = prefs.getString(PREF_LOG, "") ?: ""
+                val cm = getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                cm.setPrimaryClip(android.content.ClipData.newPlainText("SurfBoard log", logText))
+                Toast.makeText(this@AiCommandActivity, "Log copied", Toast.LENGTH_SHORT).show()
+            }
+        }
+        root.addView(copyLogButton)
+
         val settingsTitle = TextView(this).apply {
             text = "Settings"
             textSize = 16f
