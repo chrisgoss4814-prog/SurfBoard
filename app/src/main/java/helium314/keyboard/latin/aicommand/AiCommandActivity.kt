@@ -326,45 +326,36 @@ class AiCommandActivity : Activity() {
 
             {"method":"GET|POST","endpoint":"/path","body":{...}|null,"done":false,"stuck":false,"reason":"short"}
 
-            You control the phone with hardware keys and focus movement only.
-            There is NO tap-by-coordinate. You move a highlight between on-screen
-            elements with the D-pad and activate the highlighted one with CENTER.
+            You drive an Android phone one step at a time to accomplish the GOAL.
+            Each turn you get the current screen (a11y_tree) where EVERY element has an
+            "index" number. You act on elements BY THEIR INDEX.
 
-            Real endpoints (these are the ONLY ones that exist):
-              GET  /a11y_tree      list on-screen elements (note which is focused)
+            Endpoints (the ones that exist):
+              GET  /a11y_tree      list elements; each has "index", "text", "className"
               GET  /state          screen + phone state (current app, focused element)
-              GET  /packages       list installed app package names
+              GET  /packages       installed app package names
+              POST /gesture        tap an element: body {"index": <the element's index>}
+              POST /gesture/swipe  scroll: body {"index": <scrollable element index>, "direction":"up|down"}
               POST /keyboard/input body {"text":"<text>"}   type into the focused field
               POST /keyboard/clear body {}                  clear the focused field
-              POST /keyboard/key   body {"key":"<KEY>"}     press a key
+              POST /keyboard/key   body {"key":"ENTER|BACKSPACE|BACK|HOME"}  press a key
 
-            Valid KEY values:
-              DPAD_UP, DPAD_DOWN, DPAD_LEFT, DPAD_RIGHT  move the focus highlight
-              DPAD_CENTER                                activate the focused element (like a tap)
-              TAB                                        move focus to next element
-              ENTER                                      confirm / submit
-              BACKSPACE                                  delete
-              BACK                                       go back
-              HOME                                       go to the home screen
-
-            HOW TO REACH AND DO ANYTHING (universal, nothing hardcoded):
-            - Read /state to see the current app and which element is focused.
-            - To press a button or open an item: move focus onto it with DPAD_* (compare
-              the focused element's position in the tree to the target and step toward it),
-              then send DPAD_CENTER to activate it.
-            - To go to another app: send HOME, then use DPAD_* to move across the launcher
-              icons to the app you want and DPAD_CENTER to open it.
-            - To type: make sure the text field is focused (DPAD_CENTER on it), then
-              /keyboard/input the text.
+            HOW TO DO ANYTHING (universal, nothing hardcoded):
+            - To press a button / open an item / tap a field: find that element in the
+              a11y_tree, read its "index", and POST /gesture with that index.
+            - To open another app: POST /keyboard/key {"key":"HOME"}, then read the screen,
+              find the app icon's index, POST /gesture on it.
+            - To type: tap the text field by its index first (POST /gesture), then
+              POST /keyboard/input with the text.
+            - To submit: POST /keyboard/key {"key":"ENTER"}.
 
             Rules:
             - Return the SINGLE best next action toward the goal.
-            - After each move, you will get a fresh screen; check the focused element changed.
-            - Use only the endpoints and KEY values listed above. Nothing else exists.
+            - Always tap by the element's "index" from the latest screen. Never invent an index.
+            - After each action you get a fresh screen; verify it changed as expected.
             - Set "done":true only when the goal is fully accomplished.
             - Set "stuck":true only if truly nothing can advance the goal.
-            - Keep "reason" under 12 words.
-        """.trimIndent()
+            - Keep "reason" under 12 words.""".trimIndent()
 
         val userContent = buildString {
             append("GOAL: ").append(goal).append("\n\n")
@@ -573,25 +564,54 @@ class AiCommandActivity : Activity() {
         val body = normalizePortalBody(action.endpoint, action.body)
         val ep = action.endpoint
 
-        // For tap/swipe, Portal build may name the endpoint differently. Try known candidates,
-        // remember the one that works, and reuse it next time.
-        val isTap = ep.contains("tap")
-        val isSwipe = ep.contains("swipe")
-        if (isTap || isSwipe) {
-            val remembered = prefs.getString(if (isTap) PREF_TAP_EP else PREF_SWIPE_EP, null)
-            val candidates = when {
-                isTap -> listOfNotNull(remembered, "/gesture/tap", "/tap", "/gesture", "/input/tap", "/action/tap", "/click").distinct()
-                else  -> listOfNotNull(remembered, "/gesture/swipe", "/swipe", "/gesture/scroll", "/scroll", "/input/swipe", "/action/swipe").distinct()
-            }
+        val isTap = ep.contains("tap") || ep.contains("click")
+        val isSwipe = ep.contains("swipe") || ep.contains("scroll")
+
+        if (isTap) {
+            // Mobilerun taps BY INDEX (tap_by_index). The element's "index" from a11y_tree
+            // is the target. Try candidate endpoint+body shapes until Portal accepts one.
+            val idx = body.optInt("index", body.optInt("i", -1))
+            val remembered = prefs.getString(PREF_TAP_EP, null)
+            // candidate = "METHOD PATH" ; body shape decided by shapeFor()
+            val candidates = listOfNotNull(
+                remembered,
+                "POST /gesture", "POST /tap", "POST /tap_by_index", "POST /element/tap",
+                "POST /a11y/tap", "POST /click", "POST /input/tap", "POST /action/tap"
+            ).distinct()
             var last = ""
             for (cand in candidates) {
-                last = portalCall(baseUrl, token, "POST", cand, body)
+                val parts = cand.split(" ")
+                val m = parts[0]; val path = parts[1]
+                val tapBody = JSONObject().apply {
+                    put("index", idx); put("i", idx)
+                    put("action", "tap"); put("type", "tap")
+                }
+                last = portalCall(baseUrl, token, m, path, tapBody)
                 if (!isUnknownMethod(last)) {
-                    prefs.edit().putString(if (isTap) PREF_TAP_EP else PREF_SWIPE_EP, cand).apply()
+                    prefs.edit().putString(PREF_TAP_EP, cand).apply()
+                    return "[$cand idx=$idx] $last"
+                }
+            }
+            return "All tap endpoints rejected (idx=$idx). Last: $last"
+        }
+
+        if (isSwipe) {
+            val remembered = prefs.getString(PREF_SWIPE_EP, null)
+            val candidates = listOfNotNull(
+                remembered,
+                "POST /gesture/swipe", "POST /swipe", "POST /gesture/scroll",
+                "POST /scroll", "POST /input/swipe"
+            ).distinct()
+            var last = ""
+            for (cand in candidates) {
+                val parts = cand.split(" ")
+                last = portalCall(baseUrl, token, parts[0], parts[1], body)
+                if (!isUnknownMethod(last)) {
+                    prefs.edit().putString(PREF_SWIPE_EP, cand).apply()
                     return "[$cand] $last"
                 }
             }
-            return "All ${if (isTap) "tap" else "swipe"} endpoints rejected. Last: $last"
+            return "All swipe endpoints rejected. Last: $last"
         }
 
         return portalCall(baseUrl, token, action.method, ep, body)
