@@ -326,28 +326,41 @@ class AiCommandActivity : Activity() {
 
             {"method":"GET|POST","endpoint":"/path","body":{...}|null,"done":false,"stuck":false,"reason":"short"}
 
-            Endpoints:
-              GET  /a11y_tree      inspect current screen elements (each element has bounds)
-              GET  /state          screen + phone state
-              POST /gesture/tap    body {"x":<int>,"y":<int>}        tap a screen point
-              POST /gesture/swipe  body {"x1":..,"y1":..,"x2":..,"y2":..} swipe/scroll
-              POST /keyboard/input body {"text":"<text to type>"}   (app encodes it for Portal)
-              POST /keyboard/clear body {}                            clears the focused field
-              POST /keyboard/key   body {"key":"ENTER|BACKSPACE|TAB|BACK|HOME"}  (app maps to key_code)
+            You control the phone with hardware keys and focus movement only.
+            There is NO tap-by-coordinate. You move a highlight between on-screen
+            elements with the D-pad and activate the highlighted one with CENTER.
 
-            To TAP an element: read its bounds from the screen state, compute the CENTER
-            point (x=(left+right)/2, y=(top+bottom)/2), and POST /gesture/tap with that x,y.
+            Real endpoints (these are the ONLY ones that exist):
+              GET  /a11y_tree      list on-screen elements (note which is focused)
+              GET  /state          screen + phone state (current app, focused element)
+              GET  /packages       list installed app package names
+              POST /keyboard/input body {"text":"<text>"}   type into the focused field
+              POST /keyboard/clear body {}                  clear the focused field
+              POST /keyboard/key   body {"key":"<KEY>"}     press a key
 
-            To OPEN ANY APP (universal, nothing hardcoded):
-            1. POST /keyboard/key {"key":"HOME"} to reach the home screen.
-            2. Open the app drawer (swipe up from bottom, or tap the app-drawer icon).
-            3. Read the screen, find the target app's icon by label, tap its center.
-            4. Wait, then continue the goal inside that app.
+            Valid KEY values:
+              DPAD_UP, DPAD_DOWN, DPAD_LEFT, DPAD_RIGHT  move the focus highlight
+              DPAD_CENTER                                activate the focused element (like a tap)
+              TAB                                        move focus to next element
+              ENTER                                      confirm / submit
+              BACKSPACE                                  delete
+              BACK                                       go back
+              HOME                                       go to the home screen
+
+            HOW TO REACH AND DO ANYTHING (universal, nothing hardcoded):
+            - Read /state to see the current app and which element is focused.
+            - To press a button or open an item: move focus onto it with DPAD_* (compare
+              the focused element's position in the tree to the target and step toward it),
+              then send DPAD_CENTER to activate it.
+            - To go to another app: send HOME, then use DPAD_* to move across the launcher
+              icons to the app you want and DPAD_CENTER to open it.
+            - To type: make sure the text field is focused (DPAD_CENTER on it), then
+              /keyboard/input the text.
 
             Rules:
             - Return the SINGLE best next action toward the goal.
-            - Prefer /gesture/tap on element centers to press buttons and open things.
-            - Use HOME + app drawer to reach any app you are not currently in.
+            - After each move, you will get a fresh screen; check the focused element changed.
+            - Use only the endpoints and KEY values listed above. Nothing else exists.
             - Set "done":true only when the goal is fully accomplished.
             - Set "stuck":true only if truly nothing can advance the goal.
             - Keep "reason" under 12 words.
@@ -504,7 +517,8 @@ class AiCommandActivity : Activity() {
                 if (b.has("key_code")) return b
                 val keyName = b.optString("key", "").uppercase()
                 val code = when (keyName) {
-                    "ENTER" -> 66
+                    "ENTER", "DONE", "GO", "SEND" -> 66
+                    "DPAD_CENTER", "CENTER", "OK", "SELECT", "CLICK", "TAP" -> 23
                     "BACKSPACE", "DELETE", "DEL" -> 67
                     "TAB" -> 61
                     "SPACE" -> 62
