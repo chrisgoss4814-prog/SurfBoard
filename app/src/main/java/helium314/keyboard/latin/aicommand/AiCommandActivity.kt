@@ -525,23 +525,21 @@ class AiCommandActivity : Activity() {
         }
     }
 
-    private fun dispatchToPortal(baseUrl: String, token: String, action: PortalAction): String {
+    /** One raw HTTP call to Portal. Returns "HTTP <code>\n<body>". */
+    private fun portalCall(baseUrl: String, token: String, method: String, endpoint: String, body: JSONObject?): String {
         return try {
-            val url = URL(baseUrl + action.endpoint)
+            val url = URL(baseUrl + endpoint)
             val conn = url.openConnection() as HttpURLConnection
-            conn.requestMethod = action.method
+            conn.requestMethod = method
             conn.setRequestProperty("Authorization", "Bearer $token")
             conn.setRequestProperty("X-Auth-Token", token)
             conn.connectTimeout = 5000
             conn.readTimeout = 15000
-
-            if (action.method == "POST") {
+            if (method == "POST") {
                 conn.doOutput = true
                 conn.setRequestProperty("Content-Type", "application/json")
-                val outBody = normalizePortalBody(action.endpoint, action.body)
-                OutputStreamWriter(conn.outputStream).use { it.write(outBody.toString()) }
+                OutputStreamWriter(conn.outputStream).use { it.write((body ?: JSONObject()).toString()) }
             }
-
             val code = conn.responseCode
             val stream = if (code in 200..299) conn.inputStream else conn.errorStream
             val responseText = stream?.bufferedReader()?.use { it.readText() } ?: ""
@@ -551,11 +549,47 @@ class AiCommandActivity : Activity() {
         }
     }
 
+    /** True if Portal rejected the endpoint name itself (so we should try another candidate). */
+    private fun isUnknownMethod(resp: String): Boolean {
+        val r = resp.lowercase()
+        return r.contains("unknown method") || r.contains("not found") || r.contains("http 404")
+    }
+
+    private fun dispatchToPortal(baseUrl: String, token: String, action: PortalAction): String {
+        val body = normalizePortalBody(action.endpoint, action.body)
+        val ep = action.endpoint
+
+        // For tap/swipe, Portal build may name the endpoint differently. Try known candidates,
+        // remember the one that works, and reuse it next time.
+        val isTap = ep.contains("tap")
+        val isSwipe = ep.contains("swipe")
+        if (isTap || isSwipe) {
+            val remembered = prefs.getString(if (isTap) PREF_TAP_EP else PREF_SWIPE_EP, null)
+            val candidates = when {
+                isTap -> listOfNotNull(remembered, "/gesture/tap", "/tap", "/gesture", "/input/tap", "/action/tap", "/click").distinct()
+                else  -> listOfNotNull(remembered, "/gesture/swipe", "/swipe", "/gesture/scroll", "/scroll", "/input/swipe", "/action/swipe").distinct()
+            }
+            var last = ""
+            for (cand in candidates) {
+                last = portalCall(baseUrl, token, "POST", cand, body)
+                if (!isUnknownMethod(last)) {
+                    prefs.edit().putString(if (isTap) PREF_TAP_EP else PREF_SWIPE_EP, cand).apply()
+                    return "[$cand] $last"
+                }
+            }
+            return "All ${if (isTap) "tap" else "swipe"} endpoints rejected. Last: $last"
+        }
+
+        return portalCall(baseUrl, token, action.method, ep, body)
+    }
+
     companion object {
         private const val PREF_API_KEY = "xai_api_key"
         private const val PREF_BASE_URL = "portal_base_url"
         private const val PREF_TOKEN = "portal_token"
         private const val DEFAULT_BASE_URL = "http://127.0.0.1:8080"
+        private const val PREF_TAP_EP = "portal_tap_endpoint"
+        private const val PREF_SWIPE_EP = "portal_swipe_endpoint"
         private const val PREF_LOG = "last_run_log"
     }
 }
